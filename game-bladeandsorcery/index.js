@@ -25,10 +25,35 @@ const MULLE_MOD_INFO = 'mod.json';
 //  the file will be located inside StreamingAssets/Mods.
 const LOAD_ORDER_FILENAME = 'loadorder.json';
 
-//GAME IS ALSO FOUND IN THE OCULUS STORE!!
+const supportedTools = [
+  {
+    id: 'SteamVR',
+    name: 'Blade and Sorcery (SteamVR)',
+    logo: 'steam.png',
+    executable: () => 'BladeAndSorcery.exe',
+    requiredFiles: [
+      'BladeAndSorcery.exe'
+    ],
+    parameters: ['-vrmode', 'openvr'],
+    relative: true,
+  },
+  {
+    id: 'OculusVR',
+    name: 'Blade and Sorcery (OculusVR)',
+    logo: 'oculus.png',
+    executable: () => 'BladeAndSorcery.exe',
+    requiredFiles: [
+      'BladeAndSorcery.exe'
+    ],
+    parameters: ['-vrmode', 'oculus'],
+    relative: true,
+  },
+];
+
+// TODO: Add Oculus detection once/if we add the Oculus game store.
 function findGame() {
-  return util.steam.findByAppId('629730')
-      .then(game => game.gamePath);
+  return util.GameStoreHelper.findByAppId('629730', 'steam')
+    .then(game => game.gamePath);
 }
 
 function createModDirectories(discovery) {
@@ -52,7 +77,7 @@ async function ensureModType(discovery, api) {
   // Aims to ensure that the user's mods are all assigned
   //  the correct modType for their game version.
   //  (We're doing this as users may jump between 8.4 and older versions)
-  const targetModType = await getOfficialModType(api);
+  const targetModType = await getOfficialModType(api, discovery);
   const state = api.store.getState();
   const mods = util.getSafe(state, ['persistent', 'mods', GAME_ID], {});
 
@@ -74,8 +99,10 @@ function prepareForModding(discovery, api) {
     .then(() => ensureModType(discovery, api));
 }
 
-async function getOfficialModType(api) {
-  const discoveryPath = getDiscoveryPath(api);
+async function getOfficialModType(api, discovery = undefined) {
+  const discoveryPath = (discovery?.path !== undefined)
+    ? discovery.path
+    : getDiscoveryPath(api);
   if (discoveryPath === undefined) {
     return Promise.reject(new Error('Game is not discovered'));
   }
@@ -104,14 +131,19 @@ async function getDeployedManaged(context, modType) {
       const modName = await getModName(path.join(deployPath, manifest.relPath), 'Name');
       accum.push({ modName, modId: manifest.source });
     } catch (err) {
-      // The only way this can occur is if the user had manipulated the file
+      // The can occur if the user had manipulated the file
       //  in staging if using symlinks or he had moved/removed the file in
       //  the mod's folder completely.
-      log('error', 'manifest is missing', err);
+      // Since game version 8.4 this can also happen if the name in the manifest is
+      // no longer valid.
+      context.api.showErrorNotification('Manifest is missing or invalid', err, {
+        id: `bas-invalid-manifest-${manifest.relPath}`,
+        allowReport: false,
+        message: manifest.relPath,
+      });
     }
     return accum;
   }, []);
-    
 }
 
 async function getDeployedExternal(context, managedNames, loKeys) {
@@ -320,6 +352,17 @@ function resolveGameVersion(discoveryPath) {
     })
 }
 
+function requiresLauncher(gamePath) {
+  // TODO: this currently ONLY works with Steam detection - if we ever
+  //  add oculus as a game store and we need to launch the game through
+  //  the store - this here needs to change.
+  return findGame()
+    .then(steamPath => (steamPath.toLowerCase() === gamePath.toLowerCase())
+      ? Promise.resolve({ launcher: 'steam', addInfo: '629730' })
+      : Promise.resolve(undefined))
+    .catch(() => Promise.resolve(undefined));
+}
+
 function main(context) {
   const getLegacyDestination = () => {
     return path.join(getDiscoveryPath(context.api), streamingAssetsPath());
@@ -341,9 +384,11 @@ function main(context) {
     requiredFiles: ['BladeAndSorcery.exe'],
     requiresCleanup: true,
     setup: (discovery) => prepareForModding(discovery, context.api),
+    supportedTools,
     environment: {
       SteamAPPId: '629730',
     },
+    requiresLauncher,
     details: {
       steamAppId: 629730,
     },

@@ -5,7 +5,11 @@ const Promise = require('bluebird');
 const path = require('path');
 const { actions, fs, log, selectors, FlexLayout, util } = require('vortex-api');
 const { parseXmlString } = require('libxmljs');
+const semver = require('semver');
+
 const CustomItemRenderer = require('./customItemRenderer');
+const { SUBMOD_FILE, GAME_ID } = require('./common');
+const { migrate026 } = require('./migrations');
 
 const APPUNI = app || remote.app;
 const LAUNCHER_EXEC = path.join('bin', 'Win64_Shipping_Client', 'TaleWorlds.MountAndBlade.Launcher.exe');
@@ -19,8 +23,6 @@ const LAUNCHER_DATA = {
 let STORE_ID;
 let CACHE = {};
 
-// Nexus Mods id for the game.
-const GAME_ID = 'mountandblade2bannerlord';
 const STEAMAPP_ID = 261550;
 const EPICAPP_ID = 'Chickadee';
 const MODULES = 'Modules';
@@ -46,10 +48,6 @@ const PARAMS_TEMPLATE = ['/{{gameMode}}', '_MODULES_{{subModIds}}*_MODULES_'];
 
 // The relative path to the actual game executable, not the launcher.
 const BANNERLORD_EXEC = path.join('bin', 'Win64_Shipping_Client', 'Bannerlord.exe');
-
-// Bannerlord mods have this file in their root.
-//  Casing is actually "SubModule.xml"
-const SUBMOD_FILE = "submodule.xml";
 
 async function walkAsync(dir, levelsDeep = 2) {
   let entries = [];
@@ -111,16 +109,46 @@ async function getDeployedSubModPaths(context) {
 
 async function getDeployedModData(context, subModuleFilePaths) {
   const managedIds = await getManagedIds(context);
+  const getCleanVersion = (subModId, unsanitized) => {
+    if (!unsanitized) {
+      log('debug', 'failed to sanitize/coerce version', { subModId, unsanitized });
+      return undefined;
+    }
+    try {
+      const sanitized = unsanitized.replace(/[a-z]|[A-Z]/g, '');
+      const coerced = semver.coerce(sanitized);
+      return coerced.version;
+    } catch (err) {
+      log('debug', 'failed to sanitize/coerce version', { subModId, unsanitized, error: err.message });
+      return undefined;
+    }
+  };
+
   return Promise.reduce(subModuleFilePaths, async (accum, subModFile) => {
     try {
       const subModData = await getXMLData(subModFile);
       const subModId = subModData.get('//Id').attr('value').value();
+      const subModVerData = subModData.get('//Version').attr('value').value();
+      const subModVer = getCleanVersion(subModId, subModVerData);
       const managedEntry = managedIds.find(entry => entry.subModId === subModId);
       const isMultiplayer = (!!subModData.get(`//${XML_EL_MULTIPLAYER}`));
       const depNodes = subModData.find('//DependedModule');
       let dependencies = [];
       try {
-        dependencies = depNodes.map(depNode => depNode.attr('Id').value());
+        dependencies = depNodes.map(depNode => {
+          let depVersion;
+          const depId = depNode.attr('Id').value();
+          try {
+            const unsanitized = depNode.attr('DependentVersion').value();
+            depVersion = getCleanVersion(subModId, unsanitized);
+          } catch (err) {
+            // DependentVersion is an optional attribute, it's not a big deal if
+            //  it's missing.
+            log('debug', 'failed to resolve dependency version', { subModId, error: err.message });
+          }
+
+          return { depId, depVersion };
+        });
       } catch (err) {
         log('debug', 'submodule has no dependencies or is invalid', err);
       }
@@ -129,6 +157,7 @@ async function getDeployedModData(context, subModuleFilePaths) {
       accum[subModId] = {
         subModId,
         subModName,
+        subModVer,
         subModFile,
         vortexId: !!managedEntry ? managedEntry.vortexId : subModId,
         isOfficial: OFFICIAL_MODULES.has(subModId),
@@ -136,8 +165,14 @@ async function getDeployedModData(context, subModuleFilePaths) {
         isMultiplayer,
         dependencies,
         invalid: {
-          cyclic: [], // Will hold the submod ids of any detected cyclic dependencies.
-          missing: [], // Will hold the submod ids of any missing dependencies.
+          // Will hold the submod ids of any detected cyclic dependencies.
+          cyclic: [],
+
+          // Will hold the submod ids of any missing dependencies.
+          missing: [],
+
+          // Will hold the submod ids of supposedly incompatible dependencies (version-wise)
+          incompatibleDeps: [],
         },
       };
     } catch(err) {
@@ -383,13 +418,16 @@ async function installSubModules(files, destinationPath) {
     const segments = file.split(path.sep);
     return path.extname(segments[segments.length - 1]) !== '';
   });
+  const subModIds = [];
   const subMods = filtered.filter(file => path.basename(file).toLowerCase() === SUBMOD_FILE);
   return Promise.reduce(subMods, async (accum, modFile) => {
     const segments = modFile.split(path.sep).filter(seg => !!seg);
+    const subModId = await getElementValue(path.join(destinationPath, modFile), 'Id');
     const modName = (segments.length > 1)
       ? segments[segments.length - 2]
-      : await getElementValue(modFile, 'Id');
+      : subModId;
 
+    subModIds.push(subModId);
     const idx = modFile.toLowerCase().indexOf(SUBMOD_FILE);
     // Filter the mod files for this specific submodule.
     const subModFiles = filtered.filter(file => file.slice(0, idx) == modFile.slice(0, idx));
@@ -400,7 +438,14 @@ async function installSubModules(files, destinationPath) {
     }));
     return accum.concat(instructions);
   }, [])
-  .then(merged => Promise.resolve({ instructions: merged }));
+  .then(merged => {
+    const subModIdsAttr = {
+      type: 'attribute',
+      key: 'subModIds',
+      value: subModIds,
+    }
+    return Promise.resolve({ instructions: [].concat(merged, [subModIdsAttr]) })
+  });
 }
 
 function ensureOfficialLauncher(context, discovery) {
@@ -548,9 +593,11 @@ function getValidationInfo(modVortexId) {
   const subModId = Object.keys(CACHE).find(key => CACHE[key].vortexId === modVortexId);
   const cyclic = util.getSafe(CACHE[subModId], ['invalid', 'cyclic'], []);
   const missing = util.getSafe(CACHE[subModId], ['invalid', 'missing'], []);
+  const incompatible = util.getSafe(CACHE[subModId], ['invalid', 'incompatibleDeps'], []);
   return {
     cyclic,
     missing,
+    incompatible,
   }
 }
 
@@ -558,6 +605,7 @@ function tSort(subModIds, allowLocked = false, loadOrder = undefined) {
   // Topological sort - we need to:
   //  - Identify cyclic dependencies.
   //  - Identify missing dependencies.
+  //  - We will try to identify incompatible dependencies (version-wise)
 
   // These are manually locked mod entries.
   const lockedSubMods = (!!loadOrder)
@@ -571,8 +619,9 @@ function tSort(subModIds, allowLocked = false, loadOrder = undefined) {
   const alphabetical = subModIds.filter(subMod => !lockedSubMods.includes(subMod))
                                 .sort();
   const graph = alphabetical.reduce((accum, entry) => {
+    const depIds = [...CACHE[entry].dependencies].map(dep => dep.depId);
     // Create the node graph.
-    accum[entry] = CACHE[entry].dependencies.sort();
+    accum[entry] = depIds.sort();
     return accum;
   }, {});
 
@@ -602,6 +651,27 @@ function tSort(subModIds, allowLocked = false, loadOrder = undefined) {
         visited[node] = true;
         processing[node] = false;
         continue;
+      }
+
+      const incompatibleDeps = CACHE[node].invalid.incompatibleDeps;
+      const incDep = incompatibleDeps.find(d => d.depId === dep);
+      if (Object.keys(graph).includes(dep) && (incDep === undefined)) {
+        const depVer = CACHE[dep].subModVer;
+        const depInst = CACHE[node].dependencies.find(d => d.depId === dep);
+        try {
+          const match = semver.satisfies(depInst.depVersion, depVer);
+          if (!match && !!depInst?.depVersion && !!depVer) {
+            CACHE[node].invalid.incompatibleDeps.push({
+              depId: dep,
+              requiredVersion: depInst.depVersion,
+              currentVersion: depVer,
+            });
+          }
+        } catch (err) {
+          // Ok so we didn't manage to compare the versions, we log this and
+          //  continue.
+          log('debug', 'failed to compare versions', err);
+        }
       }
 
       if (!visited[dep] && !lockedSubMods.includes(dep)) {
@@ -645,7 +715,63 @@ function tSort(subModIds, allowLocked = false, loadOrder = undefined) {
   return tamperedResult;
 }
 
-async function preSort(context, items, direction) {
+function isExternal(context, subModId) {
+  const state = context.api.getState();
+  const mods = util.getSafe(state, ['persistent', 'mods', GAME_ID], {});
+  const modIds = Object.keys(mods);
+  modIds.forEach(modId => {
+    const subModIds = util.getSafe(mods[modId], ['attributes', 'subModIds'], []);
+    if (subModIds.includes(subModId)) {
+      return false;
+    }
+  })
+  return true;
+}
+
+let refreshFunc;
+async function refreshCacheOnEvent(context, profileId) {
+  CACHE = {};
+  if (profileId === undefined) {
+    return Promise.resolve();
+  }
+  const state = context.api.store.getState();
+  const activeProfile = selectors.activeProfile(state);
+  const deployProfile = selectors.profileById(state, profileId);
+  if ((activeProfile?.gameId !== deployProfile?.gameId) || (activeProfile?.gameId !== GAME_ID)) {
+    // Deployment event seems to be executed for a profile other
+    //  than the currently active one. Not going to continue.
+    return Promise.resolve();
+  }
+
+  try {
+    const deployedSubModules = await getDeployedSubModPaths(context);
+    CACHE = await getDeployedModData(context, deployedSubModules);
+  } catch (err) {
+    // ProcessCanceled means that we were unable to scan for deployed
+    //  subModules, probably because game discovery is incomplete.
+    // It's beyond the scope of this function to report discovery
+    //  related issues.
+    return (err instanceof util.ProcessCanceled)
+      ? Promise.resolve()
+      : Promise.reject(err);
+  }
+
+  const loadOrder = util.getSafe(state, ['persistent', 'loadOrder', profileId], {});
+
+  // We're going to do a quick tSort at this point - not going to
+  //  change the user's load order, but this will highlight any
+  //  cyclic or missing dependencies.
+  const modIds = Object.keys(CACHE);
+  const sorted = tSort(modIds, true, loadOrder);
+
+  if (refreshFunc !== undefined) {
+    refreshFunc();
+  }
+
+  return refreshGameParams(context, loadOrder);
+}
+
+async function preSort(context, items, direction, updateType) {
   const state = context.api.store.getState();
   const activeProfile = selectors.activeProfile(state);
   if (activeProfile?.id === undefined || activeProfile?.gameId !== GAME_ID) {
@@ -653,7 +779,17 @@ async function preSort(context, items, direction) {
     return items;
   }
 
-  const modIds = Object.keys(CACHE);
+  let modIds = Object.keys(CACHE);
+  if (items.length > 0 && modIds.length === 0) {
+    // Cache hasn't been populated yet.
+    try {
+      // Refresh the cache.
+      await refreshCacheOnEvent(context, activeProfile.id);
+      modIds = Object.keys(CACHE);
+    } catch (err) {
+      return Promise.reject(err);
+    }
+  }
 
   // Locked ids are always at the top of the list as all
   //  other modules depend on these.
@@ -719,7 +855,7 @@ async function preSort(context, items, direction) {
     id: CACHE[key].vortexId,
     name: CACHE[key].subModName,
     imgUrl: `${__dirname}/gameart.jpg`,
-    external: true,
+    external: isExternal(context, CACHE[key].vortexId),
     official: OFFICIAL_MODULES.has(key),
   }))
     .sort((a, b) => (loadOrder[a.id]?.pos || getNextPos(a.id)) - (loadOrder[b.id]?.pos || getNextPos(b.id)))
@@ -742,7 +878,7 @@ async function preSort(context, items, direction) {
       id: CACHE[key].vortexId,
       name: CACHE[key].subModName,
       imgUrl: `${__dirname}/gameart.jpg`,
-      external: unknownExt.includes(key),
+      external: isExternal(context, CACHE[key].vortexId),
       official: OFFICIAL_MODULES.has(key),
     }));
 
@@ -816,7 +952,6 @@ function main(context) {
     },
   });
 
-  let refreshFunc;
   // Register the LO page.
   context.registerLoadOrderPage({
     gameId: GAME_ID,
@@ -830,11 +965,16 @@ function main(context) {
     itemRenderer: CustomItemRenderer.default,
   });
 
-  // We currently have only one mod on NM and it is a root mod.
   context.registerInstaller('bannerlordrootmod', 20, testRootMod, installRootMod);
 
   // Installs one or more submodules.
   context.registerInstaller('bannerlordsubmodules', 25, testForSubmodules, installSubModules);
+
+  // A very simple migration that intends to add the subModIds attribute
+  //  to mods that act as "mod packs". This migration is non-invasive and will
+  //  not report any errors. Side effects of the migration not working correctly
+  //  will not affect the user's existing environment.
+  context.registerMigration(old => migrate026(context.api, old));
 
   context.registerAction('generic-load-order-icons', 200,
     _IS_SORTING ? 'spinner' : 'loot-sort', {}, 'Auto Sort', async () => {
@@ -912,62 +1052,18 @@ function main(context) {
     return (gameId === GAME_ID);
   });
 
-  const refreshCacheOnEvent = async (profileId) => {
-    CACHE = {};
-    if (profileId === undefined) {
-      return Promise.resolve();
-    }
-    const state = context.api.store.getState();
-    const activeProfile = selectors.activeProfile(state);
-    const deployProfile = selectors.profileById(state, profileId);
-    if (!!activeProfile && !!deployProfile && (deployProfile.id !== activeProfile.id)) {
-      // Deployment event seems to be executed for a profile other
-      //  than the currently active one. Not going to continue.
-      return Promise.resolve();
-    }
-
-    if (activeProfile?.gameId !== GAME_ID) {
-      // Different game
-      return Promise.resolve();
-    }
-
-    try {
-      const deployedSubModules = await getDeployedSubModPaths(context);
-      CACHE = await getDeployedModData(context, deployedSubModules);
-    } catch (err) {
-      // ProcessCanceled means that we were unable to scan for deployed
-      //  subModules, probably because game discovery is incomplete.
-      // It's beyond the scope of this function to report discovery
-      //  related issues.
-      return (err instanceof util.ProcessCanceled)
-        ? Promise.resolve()
-        : Promise.reject(err);
-    }
-
-    const loadOrder = util.getSafe(state, ['persistent', 'loadOrder', activeProfile.id], {});
-
-    // We're going to do a quick tSort at this point - not going to
-    //  change the user's load order, but this will highlight any
-    //  cyclic or missing dependencies.
-    const modIds = Object.keys(CACHE);
-    const sorted = tSort(modIds, true, loadOrder);
-
-    if (!!refreshFunc) {
-      refreshFunc();
-    }
-
-    return refreshGameParams(context, loadOrder);
-  }
-
   context.once(() => {
     context.api.onAsync('did-deploy', async (profileId, deployment) =>
-      refreshCacheOnEvent(profileId));
+      refreshCacheOnEvent(context, profileId));
 
     context.api.onAsync('did-purge', async (profileId) =>
-      refreshCacheOnEvent(profileId));
+      refreshCacheOnEvent(context, profileId));
 
-    context.api.events.on('profile-did-change', (profileId) =>
-      refreshCacheOnEvent(profileId));
+    context.api.events.on('gamemode-activated', (gameMode) => {
+      const state = context.api.getState();
+      const prof = selectors.activeProfile(state);
+      refreshCacheOnEvent(context, prof?.id);
+    });
 
     context.api.onAsync('added-files', async (profileId, files) => {
       const state = context.api.store.getState();

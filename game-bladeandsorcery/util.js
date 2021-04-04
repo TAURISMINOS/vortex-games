@@ -35,26 +35,48 @@ async function getJSONElement(filePath, element) {
 }
 
 async function getModName(manifestFilePath, element, ext) {
-  let modName;
-  try {
-    modName = await getJSONElement(manifestFilePath, element);
-  } catch (err) {
-    return Promise.reject(err);
-  }
+  // The game itself is expecting the folder name of the mod
+  //  to be added to the load order file - the game does not read the manifest
+  //  which will probably have to change one day if some sort of mod dependencies
+  //  system is needed (cross that bridge when we get to it)
+  //
+  //  In 8.4 bundled assets need to specify the exact location of their assets.
+  //  Our understanding of the bundler was that it automatically generates the
+  //  manifest file using the paths they defined for their assets, but apparently
+  //  that's only partly true as the mod author needs to copy/paste the resulting
+  //  folder names into the manifest file's name property (which gives them the
+  //  chance to change the name to whatever they want) e.g.
+  //  https://www.nexusmods.com/bladeandsorcery/mods/3064
+  //
+  //  Hence we have no choice but to temporarily dumb down how we ascertain the
+  //  mod's name and use whatever folder name the mod authors included in their
+  //  archive - if there is one.
+  //
+  //  tldr: we're putting this hack in because mod authors appear to
+  //  modify the name of the mod in the manifest file, creating a mismatch between
+  //  asset paths and the manifest.
+  const folderName = path.basename(path.dirname(manifestFilePath));
+  let modName = (path.extname(folderName) === '.installing')
+    // The mod's files are distributed looseley - no folder - read manifest.
+    ? await getJSONElement(manifestFilePath, element)
+    // The mod author included a mod folder - use that as the mod name.
+    : folderName;
 
   if (modName === undefined) {
-    return Promise.reject(new util.DataInvalid(`"${element}" JSON element is missing`));
+    throw new util.DataInvalid(`"${element}" JSON element is missing`);
   }
 
-  // remove all characters except for characters and numbers.
-  modName = modName.replace(/[^a-zA-Z0-9]+/g, '');
+  if (!util.isFilenameValid(modName)) {
+    throw new util.DataInvalid(
+      "Mod name invalid. Starting with game version 8.4, mod names have to be valid file names.");
+  }
 
-  return ext !== undefined
-    ? Promise.resolve(path.basename(modName, ext))
-    : Promise.resolve(modName);
+  return (ext !== undefined)
+    ? path.basename(modName, ext)
+    : modName;
 }
 
-function findGameConfig(discoveryPath) {
+async function findGameConfig(discoveryPath) {
   const findConfig = (searchPath) => fs.readdirAsync(searchPath)
     .catch(err => {
       return ['ENOENT', 'ENOTFOUND'].includes(err.code)
@@ -74,25 +96,24 @@ function findGameConfig(discoveryPath) {
 }
 
 async function getGameVersion(discoveryPath) {
-  try {
-    const configFile = await findGameConfig(discoveryPath);
-    let gameVersion = await getJSONElement(configFile, 'gameVersion');
-    gameVersion = gameVersion.toString().replace(',', '.');
-    return Promise.resolve(gameVersion);
-  } catch (err) {
-    return Promise.reject(err);
-  }
+  const configFile = await findGameConfig(discoveryPath);
+  let gameVersion = await getJSONElement(configFile, 'gameVersion');
+  return gameVersion.toString().replace(',', '.');
 }
 
 async function getMinModVersion(discoveryPath) {
-  return findGameConfig(discoveryPath).then(configFile => {
-    return getJSONElement(configFile, 'minModVersion')
-    .then(version => { return { version, majorOnly: false } })
-    .catch(err => (err.message.indexOf('JSON element is missing') !== -1)
-      ? getJSONElement(configFile, 'gameVersion')
-          .then(version => { return { version, majorOnly: true } })
-      : Promise.reject(err));
-  });
+  const configFile = await findGameConfig(discoveryPath);
+  try {
+    const version = await getJSONElement(configFile, 'minModVersion');
+    return { version, majorOnly: false };
+  } catch (err) {
+    if (err.message.indexOf('JSON element is missing') !== -1) {
+      const version = await getJSONElement(configFile, 'gameVersion');
+      return { version, majorOnly: true };
+    } else {
+      throw err;
+    }
+  }
 }
 
 async function checkModGameVersion(destination, minModVersion, modFile) {
